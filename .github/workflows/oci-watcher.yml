@@ -13,36 +13,29 @@ jobs:
     steps:
     - name: Install OCI CLI
       run: |
-        curl -L https://raw.githubusercontent.com/oracle/oci-cli/master/scripts/install/install.sh --output install.sh
-        chmod +x install.sh
-        ./install.sh --accept-all-defaults
-        echo "$HOME/bin" >> $GITHUB_PATH
+        pip install oci-cli --quiet
+        echo "$HOME/.local/bin" >> $GITHUB_PATH
 
     - name: Configure OCI CLI
+      env:
+        OCI_USER: ${{ secrets.OCI_USER_OCID }}
+        OCI_FINGERPRINT: ${{ secrets.OCI_FINGERPRINT }}
+        OCI_TENANCY: ${{ secrets.OCI_TENANCY_OCID }}
+        OCI_KEY: ${{ secrets.OCI_PRIVATE_KEY }}
       run: |
         mkdir -p ~/.oci
-        echo "${{ secrets.OCI_PRIVATE_KEY }}" > ~/.oci/oci_api_key.pem
+        echo "$OCI_KEY" > ~/.oci/oci_api_key.pem
         chmod 600 ~/.oci/oci_api_key.pem
-        cat > ~/.oci/config << EOF
-[DEFAULT]
-user=${{ secrets.OCI_USER_OCID }}
-fingerprint=${{ secrets.OCI_FINGERPRINT }}
-tenancy=${{ secrets.OCI_TENANCY_OCID }}
-region=ap-singapore-1
-key_file=/root/.oci/oci_api_key.pem
-EOF
+        printf "[DEFAULT]\nuser=%s\nfingerprint=%s\ntenancy=%s\nregion=ap-singapore-1\nkey_file=/home/runner/.oci/oci_api_key.pem\n" \
+          "$OCI_USER" "$OCI_FINGERPRINT" "$OCI_TENANCY" > ~/.oci/config
         chmod 600 ~/.oci/config
 
     - name: Test OCI Connection
-      run: |
-        export PATH="$HOME/bin:$PATH"
-        oci iam region list
+      run: oci iam region list
 
     - name: Check A1.Flex Availability
       id: check
       run: |
-        export PATH="$HOME/bin:$PATH"
-        echo "Checking VM.Standard.A1.Flex availability..."
         SHAPE_COUNT=$(oci compute shape list \
           --compartment-id "${{ secrets.OCI_TENANCY_OCID }}" \
           --availability-domain "ybaB:AP-SINGAPORE-1-AD-1" \
@@ -51,16 +44,15 @@ EOF
         echo "Shape count: $SHAPE_COUNT"
         echo "available=$SHAPE_COUNT" >> $GITHUB_OUTPUT
         if [ "$SHAPE_COUNT" -gt "0" ]; then
-          echo "✅ CAPACITY AVAILABLE!"
+          echo "CAPACITY AVAILABLE!"
         else
-          echo "❌ No capacity yet. Will retry in 10 minutes."
+          echo "No capacity yet. Will retry in 10 minutes."
         fi
 
     - name: Trigger ORM Apply Job
       id: apply
       if: steps.check.outputs.available > 0
       run: |
-        export PATH="$HOME/bin:$PATH"
         JOB_RESPONSE=$(oci resource-manager job create-apply-job \
           --stack-id "${{ secrets.OCI_STACK_ID }}" \
           --execution-plan-strategy AUTO_APPROVED \
@@ -88,11 +80,11 @@ EOF
       run: |
         curl -s -X POST "https://api.telegram.org/bot${{ secrets.TELEGRAM_BOT_TOKEN }}/sendMessage" \
           -d chat_id="${{ secrets.TELEGRAM_CHAT_ID }}" \
-          -d text="🎉 OCI VM CREATED! Shape: VM.Standard.A1.Flex | Region: ap-singapore-1 | Check OCI Console for IP!"
+          -d text="OCI VM CREATED! Shape: VM.Standard.A1.Flex | Region: ap-singapore-1 | Check OCI Console for IP!"
 
     - name: Notify Telegram FAILED
       if: steps.apply.outputs.job_status == 'FAILED'
       run: |
         curl -s -X POST "https://api.telegram.org/bot${{ secrets.TELEGRAM_BOT_TOKEN }}/sendMessage" \
           -d chat_id="${{ secrets.TELEGRAM_CHAT_ID }}" \
-          -d text="⚠️ OCI Apply Job FAILED. Capacity found but job failed. Check OCI Console."
+          -d text="OCI Apply Job FAILED. Capacity found but job failed. Check OCI Console."
