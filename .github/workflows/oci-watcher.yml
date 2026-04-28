@@ -1,137 +1,98 @@
-# ============================================================
-#  OCI A1.Flex Capacity Watcher + Auto Apply
-#  Stack: prod docker node 01 | Region: ap-singapore-1
-# ============================================================
+name: OCI A1 Capacity Watcher
 
-# ---------- CONFIGURATION ----------
-$TENANCY_ID     = "ocid1.tenancy.oc1..aaaaaaaagduribie27jwdlalhfqqyky3b7ee7brwelhtptg3zpe7jdxbpkja"
-$STACK_ID       = "ocid1.ormstack.oc1.ap-singapore-1.amaaaaaabgaipbiahsk5dgxrsyaugp6iohq2iexrsce2rt2k7jptt6isdiua"
-$AD             = "ybaB:AP-SINGAPORE-1-AD-1"
-$SHAPE          = "VM.Standard.A1.Flex"
-$CHECK_INTERVAL = 120       # seconds between each check (2 minutes)
-$MAX_RETRIES    = 720       # 720 x 2min = 24 hours max runtime
-$LOG_FILE       = "$env:USERPROFILE\oci_watcher.log"
-# -----------------------------------
+on:
+  schedule:
+    - cron: '*/10 * * * *'
+  workflow_dispatch:
 
-function Write-Log {
-    param([string]$Message, [string]$Level = "INFO")
-    $timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
-    $line = "[$timestamp] [$Level] $Message"
-    Write-Host $line
-    Add-Content -Path $LOG_FILE -Value $line
-}
+jobs:
+  watch-and-apply:
+    runs-on: ubuntu-latest
+    timeout-minutes: 9
 
-function Check-Capacity {
-    try {
-        $result = oci compute shape list `
-            --compartment-id $TENANCY_ID `
-            --availability-domain $AD `
-            --query "data[?name=='$SHAPE']" `
-            --output json 2>$null | ConvertFrom-Json
+    steps:
+    - name: Install OCI CLI
+      run: |
+        curl -L https://raw.githubusercontent.com/oracle/oci-cli/master/scripts/install/install.sh --output install.sh
+        chmod +x install.sh
+        ./install.sh --accept-all-defaults
+        echo "$HOME/bin" >> $GITHUB_PATH
 
-        if ($result -and $result.Count -gt 0) {
-            Write-Log "Shape '$SHAPE' is listed as available in $AD"
-            return $true
-        } else {
-            Write-Log "Shape '$SHAPE' not available yet." "WARN"
-            return $false
-        }
-    } catch {
-        Write-Log "Error checking capacity: $_" "ERROR"
-        return $false
-    }
-}
+    - name: Configure OCI CLI
+      run: |
+        mkdir -p ~/.oci
+        echo "${{ secrets.OCI_PRIVATE_KEY }}" > ~/.oci/oci_api_key.pem
+        chmod 600 ~/.oci/oci_api_key.pem
+        cat > ~/.oci/config << EOF
+[DEFAULT]
+user=${{ secrets.OCI_USER_OCID }}
+fingerprint=${{ secrets.OCI_FINGERPRINT }}
+tenancy=${{ secrets.OCI_TENANCY_OCID }}
+region=ap-singapore-1
+key_file=/root/.oci/oci_api_key.pem
+EOF
+        chmod 600 ~/.oci/config
 
-function Trigger-ApplyJob {
-    Write-Log ">>> Capacity detected! Triggering ORM Apply job..." "SUCCESS"
+    - name: Test OCI Connection
+      run: |
+        export PATH="$HOME/bin:$PATH"
+        oci iam region list
 
-    try {
-        $jobJson = oci resource-manager job create-apply-job `
-            --stack-id $STACK_ID `
-            --execution-plan-strategy AUTO_APPROVED `
-            --output json 2>&1
+    - name: Check A1.Flex Availability
+      id: check
+      run: |
+        export PATH="$HOME/bin:$PATH"
+        echo "Checking VM.Standard.A1.Flex availability..."
+        SHAPE_COUNT=$(oci compute shape list \
+          --compartment-id "${{ secrets.OCI_TENANCY_OCID }}" \
+          --availability-domain "ybaB:AP-SINGAPORE-1-AD-1" \
+          --query "length(data[?name=='VM.Standard.A1.Flex'])" \
+          --raw-output 2>/dev/null || echo "0")
+        echo "Shape count: $SHAPE_COUNT"
+        echo "available=$SHAPE_COUNT" >> $GITHUB_OUTPUT
+        if [ "$SHAPE_COUNT" -gt "0" ]; then
+          echo "✅ CAPACITY AVAILABLE!"
+        else
+          echo "❌ No capacity yet. Will retry in 10 minutes."
+        fi
 
-        $job = $jobJson | ConvertFrom-Json
-        $jobId = $job.data.id
+    - name: Trigger ORM Apply Job
+      id: apply
+      if: steps.check.outputs.available > 0
+      run: |
+        export PATH="$HOME/bin:$PATH"
+        JOB_RESPONSE=$(oci resource-manager job create-apply-job \
+          --stack-id "${{ secrets.OCI_STACK_ID }}" \
+          --execution-plan-strategy AUTO_APPROVED \
+          --output json)
+        JOB_ID=$(echo "$JOB_RESPONSE" | python3 -c "import sys,json; print(json.load(sys.stdin)['data']['id'])")
+        echo "job_id=$JOB_ID" >> $GITHUB_OUTPUT
+        for i in {1..16}; do
+          sleep 30
+          STATUS=$(oci resource-manager job get \
+            --job-id "$JOB_ID" \
+            --query "data.\"lifecycle-state\"" \
+            --raw-output)
+          echo "[$i/16] Job status: $STATUS"
+          if [ "$STATUS" = "SUCCEEDED" ]; then
+            echo "job_status=SUCCEEDED" >> $GITHUB_OUTPUT
+            break
+          elif [ "$STATUS" = "FAILED" ]; then
+            echo "job_status=FAILED" >> $GITHUB_OUTPUT
+            break
+          fi
+        done
 
-        if (-not $jobId) {
-            Write-Log "Failed to get Job ID from response: $jobJson" "ERROR"
-            return
-        }
+    - name: Notify Telegram SUCCESS
+      if: steps.apply.outputs.job_status == 'SUCCEEDED'
+      run: |
+        curl -s -X POST "https://api.telegram.org/bot${{ secrets.TELEGRAM_BOT_TOKEN }}/sendMessage" \
+          -d chat_id="${{ secrets.TELEGRAM_CHAT_ID }}" \
+          -d text="🎉 OCI VM CREATED! Shape: VM.Standard.A1.Flex | Region: ap-singapore-1 | Check OCI Console for IP!"
 
-        Write-Log "Apply job created: $jobId"
-
-        # Monitor job until completion
-        $maxWait = 60   # max 60 x 30sec = 30 minutes
-        $attempt = 0
-        while ($attempt -lt $maxWait) {
-            Start-Sleep -Seconds 30
-            $attempt++
-
-            $statusJson = oci resource-manager job get `
-                --job-id $jobId `
-                --query "data.\"lifecycle-state\"" `
-                --raw-output 2>$null
-
-            Write-Log "Job status: $statusJson (check $attempt/$maxWait)"
-
-            switch ($statusJson) {
-                "SUCCEEDED" {
-                    Write-Log "========================================" "SUCCESS"
-                    Write-Log "  JOB SUCCEEDED! VM is being created.  " "SUCCESS"
-                    Write-Log "========================================" "SUCCESS"
-                    Write-Log "Check OCI Console for your new instance IP."
-                    exit 0
-                }
-                "FAILED" {
-                    Write-Log "Job FAILED. Check OCI Console for error details." "ERROR"
-                    Write-Log "Resuming capacity watch in case of transient error..."
-                    return   # Don't exit — keep watching
-                }
-                "CANCELED" {
-                    Write-Log "Job was CANCELED." "ERROR"
-                    exit 1
-                }
-                default {
-                    # Still running: ACCEPTED, IN_PROGRESS, etc.
-                }
-            }
-        }
-        Write-Log "Job monitoring timed out. Check OCI Console manually." "WARN"
-    } catch {
-        Write-Log "Exception during apply job: $_" "ERROR"
-    }
-}
-
-# ============================================================
-#  MAIN LOOP
-# ============================================================
-Write-Log "=================================================="
-Write-Log " OCI Capacity Watcher Started"
-Write-Log " Shape  : $SHAPE"
-Write-Log " AD     : $AD"
-Write-Log " Stack  : prod docker node 01"
-Write-Log " Interval: every $CHECK_INTERVAL seconds"
-Write-Log " Log    : $LOG_FILE"
-Write-Log "=================================================="
-
-$attempt = 0
-$triggered = $false
-
-while ($attempt -lt $MAX_RETRIES -and -not $triggered) {
-    $attempt++
-    $remaining = $MAX_RETRIES - $attempt
-    Write-Log "Attempt $attempt/$MAX_RETRIES | ~$([math]::Round($remaining * $CHECK_INTERVAL / 60)) min remaining"
-
-    if (Check-Capacity) {
-        $triggered = $true
-        Trigger-ApplyJob
-    } else {
-        Write-Log "Waiting $CHECK_INTERVAL seconds before next check..."
-        Start-Sleep -Seconds $CHECK_INTERVAL
-    }
-}
-
-if (-not $triggered) {
-    Write-Log "Max retries reached (24h). No capacity found. Re-run the script to try again." "WARN"
-}
+    - name: Notify Telegram FAILED
+      if: steps.apply.outputs.job_status == 'FAILED'
+      run: |
+        curl -s -X POST "https://api.telegram.org/bot${{ secrets.TELEGRAM_BOT_TOKEN }}/sendMessage" \
+          -d chat_id="${{ secrets.TELEGRAM_CHAT_ID }}" \
+          -d text="⚠️ OCI Apply Job FAILED. Capacity found but job failed. Check OCI Console."
