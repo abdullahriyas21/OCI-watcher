@@ -1,0 +1,137 @@
+# ============================================================
+#  OCI A1.Flex Capacity Watcher + Auto Apply
+#  Stack: prod docker node 01 | Region: ap-singapore-1
+# ============================================================
+
+# ---------- CONFIGURATION ----------
+$TENANCY_ID     = "ocid1.tenancy.oc1..aaaaaaaagduribie27jwdlalhfqqyky3b7ee7brwelhtptg3zpe7jdxbpkja"
+$STACK_ID       = "ocid1.ormstack.oc1.ap-singapore-1.amaaaaaabgaipbiahsk5dgxrsyaugp6iohq2iexrsce2rt2k7jptt6isdiua"
+$AD             = "ybaB:AP-SINGAPORE-1-AD-1"
+$SHAPE          = "VM.Standard.A1.Flex"
+$CHECK_INTERVAL = 120       # seconds between each check (2 minutes)
+$MAX_RETRIES    = 720       # 720 x 2min = 24 hours max runtime
+$LOG_FILE       = "$env:USERPROFILE\oci_watcher.log"
+# -----------------------------------
+
+function Write-Log {
+    param([string]$Message, [string]$Level = "INFO")
+    $timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+    $line = "[$timestamp] [$Level] $Message"
+    Write-Host $line
+    Add-Content -Path $LOG_FILE -Value $line
+}
+
+function Check-Capacity {
+    try {
+        $result = oci compute shape list `
+            --compartment-id $TENANCY_ID `
+            --availability-domain $AD `
+            --query "data[?name=='$SHAPE']" `
+            --output json 2>$null | ConvertFrom-Json
+
+        if ($result -and $result.Count -gt 0) {
+            Write-Log "Shape '$SHAPE' is listed as available in $AD"
+            return $true
+        } else {
+            Write-Log "Shape '$SHAPE' not available yet." "WARN"
+            return $false
+        }
+    } catch {
+        Write-Log "Error checking capacity: $_" "ERROR"
+        return $false
+    }
+}
+
+function Trigger-ApplyJob {
+    Write-Log ">>> Capacity detected! Triggering ORM Apply job..." "SUCCESS"
+
+    try {
+        $jobJson = oci resource-manager job create-apply-job `
+            --stack-id $STACK_ID `
+            --execution-plan-strategy AUTO_APPROVED `
+            --output json 2>&1
+
+        $job = $jobJson | ConvertFrom-Json
+        $jobId = $job.data.id
+
+        if (-not $jobId) {
+            Write-Log "Failed to get Job ID from response: $jobJson" "ERROR"
+            return
+        }
+
+        Write-Log "Apply job created: $jobId"
+
+        # Monitor job until completion
+        $maxWait = 60   # max 60 x 30sec = 30 minutes
+        $attempt = 0
+        while ($attempt -lt $maxWait) {
+            Start-Sleep -Seconds 30
+            $attempt++
+
+            $statusJson = oci resource-manager job get `
+                --job-id $jobId `
+                --query "data.\"lifecycle-state\"" `
+                --raw-output 2>$null
+
+            Write-Log "Job status: $statusJson (check $attempt/$maxWait)"
+
+            switch ($statusJson) {
+                "SUCCEEDED" {
+                    Write-Log "========================================" "SUCCESS"
+                    Write-Log "  JOB SUCCEEDED! VM is being created.  " "SUCCESS"
+                    Write-Log "========================================" "SUCCESS"
+                    Write-Log "Check OCI Console for your new instance IP."
+                    exit 0
+                }
+                "FAILED" {
+                    Write-Log "Job FAILED. Check OCI Console for error details." "ERROR"
+                    Write-Log "Resuming capacity watch in case of transient error..."
+                    return   # Don't exit — keep watching
+                }
+                "CANCELED" {
+                    Write-Log "Job was CANCELED." "ERROR"
+                    exit 1
+                }
+                default {
+                    # Still running: ACCEPTED, IN_PROGRESS, etc.
+                }
+            }
+        }
+        Write-Log "Job monitoring timed out. Check OCI Console manually." "WARN"
+    } catch {
+        Write-Log "Exception during apply job: $_" "ERROR"
+    }
+}
+
+# ============================================================
+#  MAIN LOOP
+# ============================================================
+Write-Log "=================================================="
+Write-Log " OCI Capacity Watcher Started"
+Write-Log " Shape  : $SHAPE"
+Write-Log " AD     : $AD"
+Write-Log " Stack  : prod docker node 01"
+Write-Log " Interval: every $CHECK_INTERVAL seconds"
+Write-Log " Log    : $LOG_FILE"
+Write-Log "=================================================="
+
+$attempt = 0
+$triggered = $false
+
+while ($attempt -lt $MAX_RETRIES -and -not $triggered) {
+    $attempt++
+    $remaining = $MAX_RETRIES - $attempt
+    Write-Log "Attempt $attempt/$MAX_RETRIES | ~$([math]::Round($remaining * $CHECK_INTERVAL / 60)) min remaining"
+
+    if (Check-Capacity) {
+        $triggered = $true
+        Trigger-ApplyJob
+    } else {
+        Write-Log "Waiting $CHECK_INTERVAL seconds before next check..."
+        Start-Sleep -Seconds $CHECK_INTERVAL
+    }
+}
+
+if (-not $triggered) {
+    Write-Log "Max retries reached (24h). No capacity found. Re-run the script to try again." "WARN"
+}
